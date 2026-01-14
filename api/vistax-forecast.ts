@@ -8,7 +8,7 @@ type CalendarEvent = {
   source?: string;
 };
 
-type DayStatus = "GOOD" | "CAUTION" | "NO_RUN";
+type DayStatus = "GOOD" | "CAUTION" | "NO_RUN" | "PENDING";
 
 type DayForecast = {
   date: string; // YYYY-MM-DD (UTC bucket)
@@ -21,6 +21,7 @@ type DayForecast = {
     hasHighUsd: boolean;
     hasFomc: boolean;
     isDayAfterFomc: boolean;
+    isPending: boolean;
   };
 };
 
@@ -42,6 +43,22 @@ function addDaysUTC(d: Date, days: number) {
   const nd = new Date(d);
   nd.setUTCDate(nd.getUTCDate() + days);
   return nd;
+}
+
+function getUtcWeekStartSunday(d: Date) {
+  // Sunday 00:00:00 UTC of current week
+  const day = d.getUTCDay(); // 0=Sun
+  const ws = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0));
+  ws.setUTCDate(ws.getUTCDate() - day);
+  return ws;
+}
+
+function getUtcWeekEndSaturday(d: Date) {
+  const ws = getUtcWeekStartSunday(d);
+  const we = new Date(ws);
+  we.setUTCDate(we.getUTCDate() + 6);
+  we.setUTCHours(0, 0, 0, 0);
+  return we;
 }
 
 function normalizeImpact(val: any): string {
@@ -77,7 +94,7 @@ function isFomc(ev: CalendarEvent) {
     t.includes("fomc") ||
     t.includes("federal open market") ||
     t.includes("fed funds") ||
-    t.includes("interest rate decision") && t.includes("fed")
+    (t.includes("interest rate decision") && t.includes("fed"))
   );
 }
 
@@ -88,7 +105,7 @@ function isFomc(ev: CalendarEvent) {
  *
  * NOTE: We are NOT scraping HTML — we are consuming an export feed.
  */
-async function fetchForexFactoryThisWeek(): Promise<CalendarEvent[]> {
+async function fetchForexFactoryThisWeek(): Promise<{ events: CalendarEvent[]; sourceUpdatedAtUtc?: string }> {
   const url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
 
   const r = await fetch(url, {
@@ -97,14 +114,16 @@ async function fetchForexFactoryThisWeek(): Promise<CalendarEvent[]> {
 
   if (!r.ok) throw new Error(`ForexFactory error: ${r.status}`);
 
+  // best-effort: use Last-Modified header as “source updated at”
+  const lastModified = r.headers.get("last-modified");
+  const sourceUpdatedAtUtc = lastModified ? new Date(lastModified).toISOString() : undefined;
+
   const data = await r.json();
 
   // The feed is typically an array; still handle variants defensively.
   const arr = Array.isArray(data) ? data : (data?.events ?? data?.data ?? []);
-  if (!Array.isArray(arr)) return [];
+  if (!Array.isArray(arr)) return { events: [], sourceUpdatedAtUtc };
 
-  // Map ForexFactory fields as best-effort. Their schema can change,
-  // so we try multiple possible keys.
   const mapped: CalendarEvent[] = arr.map((it: any) => {
     const title =
       String(it.title ?? it.event ?? it.name ?? it.Event ?? "Economic Event").trim();
@@ -141,7 +160,7 @@ async function fetchForexFactoryThisWeek(): Promise<CalendarEvent[]> {
     };
   });
 
-  return mapped;
+  return { events: mapped, sourceUpdatedAtUtc };
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -154,13 +173,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === "OPTIONS") return res.status(204).end();
 
   try {
-    // Build next 7 days UTC buckets
     const now = new Date();
+
+    // ✅ Week window (UTC): Sun->Sat (what FF “thisweek” represents)
+    const weekStart = getUtcWeekStartSunday(now);
+    const weekEnd = getUtcWeekEndSaturday(now);
+    const weekStartYmd = toYmdUTC(weekStart);
+    const weekEndYmd = toYmdUTC(weekEnd);
+
+    // Build next 7 days UTC buckets (rolling UI), BUT mark beyond weekEnd as PENDING
     const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
     const end = addDaysUTC(start, 7);
 
     // Fetch weekly FF calendar export, then filter to "Red folder USD only"
-    const rawEvents = await fetchForexFactoryThisWeek();
+    const ff = await fetchForexFactoryThisWeek();
+    const rawEvents = ff.events;
+    const sourceUpdatedAtUtc = ff.sourceUpdatedAtUtc;
 
     const redUsdEvents = rawEvents.filter((e) => isUSD(e) && isHighImpact(e));
 
@@ -186,6 +214,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const ymd = toYmdUTC(d);
       const weekday = weekdayUTC(d);
 
+      // ✅ If beyond current published week window, force PENDING
+      const isPending = ymd > weekEndYmd;
+
+      if (isPending) {
+        days.push({
+          date: ymd,
+          weekday,
+          status: "PENDING",
+          reasons: ["Next week calendar not published yet"],
+          events: [],
+          flags: {
+            isFriday: weekday.toLowerCase() === "friday",
+            hasHighUsd: false,
+            hasFomc: false,
+            isDayAfterFomc: false,
+            isPending: true,
+          },
+        });
+        continue;
+      }
+
       const dayEvents = (byDay.get(ymd) || []).sort((a, b) =>
         a.datetimeUtc.localeCompare(b.datetimeUtc)
       );
@@ -204,7 +253,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (isDayAfterFomc) reasons.push("Day after FOMC");
       if (hasHighUsd) reasons.push("High-impact USD news day (red folder routine)");
 
-      // Status rules
+      // Status rules (internal logic; UI can label however it wants)
       let status: DayStatus = "GOOD";
       if (isFriday || hasHighUsd || hasFomc || isDayAfterFomc) status = "NO_RUN";
 
@@ -214,7 +263,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         status,
         reasons: Array.from(new Set(reasons)),
         events: dayEvents,
-        flags: { isFriday, hasHighUsd, hasFomc, isDayAfterFomc },
+        flags: { isFriday, hasHighUsd, hasFomc, isDayAfterFomc, isPending: false },
       });
     }
 
@@ -227,9 +276,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       routine: ROUTINE,
       generatedAtUtc: new Date().toISOString(),
       rangeUtc: { start: start.toISOString(), end: end.toISOString() },
+
+      // ✅ NEW metadata for your upgraded embed
+      weekStartYmd,
+      weekEndYmd,
+      source: "ForexFactory",
+      sourceUpdatedAtUtc: sourceUpdatedAtUtc || new Date().toISOString(),
+
       days,
       disclaimer: [
-        "This forecast is based on one commonly used VistaX routine many kazpa members have seen success with.",
+        "This tool highlights days that may carry higher risk based on a commonly used VistaX routine filter.",
         "You are free to use VistaX however you want.",
         "Not financial advice. No guarantees. You are responsible for all trading decisions.",
         "Always confirm your own news filters and trading plan before running any automation.",
